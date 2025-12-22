@@ -89,12 +89,6 @@ class LLMAgent:
             "user_id": request.user_id or "anonymous_user",
             "stream": True,
             "additional_messages": [
-                {
-                    "content": request.prompt,
-                    "content_type": "text",
-                    "role": "user",
-                    "type": "question"
-                }
             ],
             "parameters": {}
         }
@@ -103,13 +97,13 @@ class LLMAgent:
         if context:
             # 将历史对话添加到additional_messages的开头
             for msg in context:
-                body["additional_messages"].insert(0, {
+                body["additional_messages"].append({
                     "content": msg["content"],
                     "content_type": "text",
                     "role": msg["role"],
                     "type": "question" if msg["role"] == "user" else "answer"
                 })
-        
+        print("Request Body:", json.dumps(body, ensure_ascii=False, indent=2))
         try:
             # 发起流式请求
             async with self.client.stream(

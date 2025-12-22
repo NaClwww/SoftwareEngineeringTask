@@ -1,7 +1,8 @@
 import asyncio
 import json
 from typing import Optional
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -22,6 +23,15 @@ if os.path.exists(".env"):
                 os.environ[key] = value
 
 app = FastAPI(title="PJGQ Health Agent", description="Health agent with LLM capabilities")
+
+# CORS 设置，允许前端的 POST/OPTIONS 访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 添加安全方案
 security = HTTPBearer()
@@ -116,7 +126,7 @@ async def update_health_data(health_data: HealthData, credentials: HTTPAuthoriza
         # 验证JWT令牌并获取用户信息
         user = get_current_user_from_token(credentials.credentials)
         if not user:
-            return {"error": "无效的认证令牌"}
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的认证令牌")
         
         user_id = user.get("user_id")
         if not user_id:
@@ -143,9 +153,9 @@ async def get_health_data(credentials: HTTPAuthorizationCredentials = Depends(se
     """获取用户的健康数据"""
     try:
         # 验证JWT令牌并获取用户信息
-        user = get_current_user_from_token(credentials.credentials)
-        if not user:
-            return {"error": "无效的认证令牌"}
+            user = get_current_user_from_token(credentials.credentials)
+            if not user:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的认证令牌")
         
         user_id = user.get("user_id")
         if not user_id:
@@ -233,9 +243,11 @@ async def stream_llm(request: QueryRequest, credentials: HTTPAuthorizationCreden
     try:
         user = get_current_user_from_token(credentials.credentials)
         if not user:
-            return {"error": "无效的认证令牌"}
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的认证令牌")
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error": f"认证失败: {str(e)}"}
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"认证失败: {str(e)}")
     
     # 从JWT令牌中获取user_id并更新请求
     user_id = user.get("user_id")
@@ -260,12 +272,34 @@ async def stream_llm(request: QueryRequest, credentials: HTTPAuthorizationCreden
         async with stream_lock:  # 串行化流式处理，避免并发导致顺序错乱
             full_response = ""
             async for chunk in llm_agent.stream_custom_llm(updated_request):
-                lines = chunk.splitlines()
-                if lines[0].split(":")[-1] =="conversation.message.delta.content":
-                    data = lines[1][5:]
-                    json = json.loads(data)
-                    content = json.get("content", "")
-                    full_response += content 
+                # chunk 可能包含多行 SSE，例如：
+                # data: event:conversation.message.delta
+                # data:{...}
+                for line in chunk.splitlines():
+                    if not line.startswith("data:"):
+                        continue
+                    # 兼容 "data: " 和 "data:{" 两种格式
+                    payload = line[len("data:"):].lstrip()
+
+                    # 跳过事件标记行或结束标记
+                    if payload.startswith("event:") or payload.startswith("[DONE]"):
+                        continue
+
+                    try:
+                        # 截取花括号内容，尽量解析 JSON
+                        start, end = payload.find("{"), payload.rfind("}")
+                        if start != -1 and end != -1 and end > start:
+                            payload = payload[start:end+1]
+                        data_obj = json.loads(payload)
+                        content = data_obj.get("content", "")
+                        full_response += content
+                    except json.JSONDecodeError:
+                        # 兜底：若是纯文本且不是事件/标记，则累积
+                        if not payload.startswith("event:") and not payload.startswith("{"):
+                            full_response += payload
+                    except Exception:
+                        pass
+
                 yield chunk
             # 保存完整的响应到对话历史
             print(f"assistant响应: {full_response}")
