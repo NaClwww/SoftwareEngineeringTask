@@ -308,107 +308,73 @@ async def stream_llm(request: QueryRequest, credentials: HTTPAuthorizationCreden
     async def save_response_and_stream():
         async with stream_lock:  # 串行化流式处理，避免并发导致顺序错乱
             full_response = ""
-            last_event_type = None  # 记录最后看到的事件类型
-            sent_contents = set()  # 全局去重：记录所有已发送的内容
             
-            async for chunk in llm_agent.stream_custom_llm(updated_request):
-                # chunk 是来自 Coze API 的原始 SSE 响应，可能包含多行
-                
-                lines = chunk.splitlines()
-                i = 0
-                while i < len(lines):
-                    line = lines[i]
-                    if not line.startswith("data:"):
-                        i += 1
+            # 生产者-消费者缓冲区：用来存储完整的行
+            line_queue = asyncio.Queue()
+            
+            # 生产者：读取 chunk 并按行分割放入队列
+            async def producer():
+                try:
+                    async for chunk in llm_agent.stream_custom_llm(updated_request):
+                        # 将 chunk 按行分割并放入队列
+                        for line in chunk.splitlines():
+                            await line_queue.put(line)
+                finally:
+                    # 发送结束标记
+                    await line_queue.put(None)
+            
+            # 消费者：从队列读取行并处理
+            async def consumer():
+                nonlocal full_response
+                while True:
+                    line = await line_queue.get()
+
+                    # None 表示流结束
+                    if line is None:
+                        break
+                    
+                    line = line.strip()
+                    
+                    # 跳过空行
+                    if not line:
                         continue
-                    
-                    payload = line[len("data:"):].strip()
-                    
-                    # 跳过空行和完成标记
-                    if not payload or payload == "[DONE]":
-                        i += 1
-                        continue
-                    
-                    # ===== 处理事件行 =====
-                    if payload.startswith("event:"):
-                        # 检查是否是 conversation.message.completed 事件
-                        if "conversation.message.completed" in payload:
-                            # 跳过这个事件行和下一个 data 行（一对）
-                            i += 1  # 跳过事件行
-                            # 找到并跳过下一个 data 行
-                            while i < len(lines) and not lines[i].startswith("data:"):
-                                i += 1
-                            if i < len(lines):
-                                i += 1  # 跳过那个 data 行
-                            continue
+                    # 读取下一行进行配对
+                    next_line = await line_queue.get()
+                    print(line,"\n",next_line)
+                    if line.startswith("event:conversation.message.delta"):
+
+                        next_line = next_line.strip()
+                        
+                        if next_line.startswith("data:"):
+                            try:
+                                payload = next_line[5:]  # 移除 "data:" 前缀
+                                data_obj = json.loads(payload)
+                                content = data_obj.get("content", "")
+                                
+                                full_response += content
+                                yield f"data: {json.dumps({'content': content})}\n\n"
+                                
+                            except (json.JSONDecodeError, ValueError) as e:
+                                # JSON 解析失败
+                                print(f"JSON parse error: {e}, payload: {next_line[:100]}")
                         else:
-                            # 其他事件，跳过
-                            i += 1
-                            continue
-                    
-                    # 处理 data: 行
-                    try:
-                        # 尝试解析为 JSON
-                        data_obj = json.loads(payload)
-                        
-                        # 必须是字典
-                        if not isinstance(data_obj, dict):
-                            i += 1
-                            continue
-                        
-                        # ===== 黑名单过滤 =====
-                        
-                        # 1. 检查 msg_type（最重要的过滤点）
-                        msg_type = data_obj.get("msg_type", "")
-                        if msg_type in ("generate_answer_finish", "end_turn", "conversation.message.completed", 
-                                       "tool_call", "function_call", "thinking", "reasoning"):
-                            i += 1
-                            continue
-                        
-                        # 2. 如果有 data 字段且包含 finish_reason，这是完成标记，跳过
-                        if data_obj.get("data") and "finish_reason" in str(data_obj.get("data", "")):
-                            i += 1
-                            continue
-                        
-                        # 3. 检查 type 字段（follow_up 是建议，要跳过）
-                        item_type = data_obj.get("type", "")
-                        if item_type in ("follow_up", "tool_call", "function_call"):
-                            i += 1
-                            continue
-                        
-                        # 4. 检查危险字段
-                        if data_obj.get("tool_calls") or data_obj.get("name") or data_obj.get("from_module"):
-                            i += 1
-                            continue
-                        
-                        # ===== 提取并验证内容 =====
-                        
-                        content = data_obj.get("content")
-                        if not isinstance(content, str) or not content.strip():
-                            i += 1
-                            continue
-                        
-                        # ===== 全局去重（使用相似度检测） =====
-                        
-                        # 只对足够长的内容启用相似度去重，短内容使用精确匹配
-                        # 最小长度设为10个字符，相似度阈值设为0.85
-                        if is_duplicate_content(content, sent_contents, min_length=10, similarity_threshold=0.85):
-                            i += 1
-                            continue
-                        
-                        # 记录已发送的内容并转发
-                        sent_contents.add(content)
-                        full_response += content
-                        yield f"data: {json.dumps({'content': content})}\n\n"
-                    
-                    except (json.JSONDecodeError, ValueError):
-                        # 非 JSON 数据，完全跳过
-                        pass
-                    
-                    i += 1
+                            # 下一行不是 data:，忽略这一行
+                            pass
+                    else:
+                        continue
+            # 同时运行生产者
+            producer_task = asyncio.create_task(producer())
+            
+            # 直接消费消费者产生的值
+            async for item in consumer():
+                yield item
+            
+            # 等待生产者完成
+            await producer_task
             
             # 保存完整的响应到对话历史
             if full_response:
+                print("Full LLM Response:", full_response)
                 db_manager.save_conversation_turn(user_id, "assistant", full_response)
             
             # 发送完成标记
