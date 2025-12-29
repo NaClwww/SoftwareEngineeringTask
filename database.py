@@ -93,9 +93,22 @@ class DatabaseManager:
             conn.close()
     
     def save_conversation_turn(self, user_id: str, role: str, content: str) -> int:
-        """保存对话轮次"""
+        """保存对话轮次（有去重）"""
         with self.get_connection() as conn:
             cursor = conn.cursor()
+            
+            # 检查是否已存在完全相同的对话轮次（同一用户，同一角色，同一内容的最后一条）
+            cursor.execute(
+                "SELECT id FROM conversation_history WHERE user_id = ? AND role = ? AND content = ? ORDER BY timestamp DESC LIMIT 1",
+                (user_id, role, content)
+            )
+            existing = cursor.fetchone()
+            
+            # 如果已存在，不重复插入
+            if existing:
+                return existing["id"]
+            
+            # 新内容才插入
             cursor.execute(
                 "INSERT INTO conversation_history (user_id, role, content) VALUES (?, ?, ?)",
                 (user_id, role, content)

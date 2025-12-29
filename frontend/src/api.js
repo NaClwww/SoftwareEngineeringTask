@@ -70,35 +70,25 @@ export async function streamLLM({ prompt, token, onChunk, onDone, onError }) {
         if (!payload) continue;
         if (payload === '[DONE]') continue;
 
-        // 跳过所有 event: 开头的行
-        if (payload.startsWith('event:')) {
-          continue;
-        }
-
         try {
-          // 严格解析 JSON，必须是有效的 JSON
+          // 解析 JSON
           const dataObj = JSON.parse(payload);
           
-          // 必须是对象且有 content 字段
-          if (!dataObj || typeof dataObj !== 'object') {
-            continue;
+          // 检查是否有 content 字段
+          if (dataObj && typeof dataObj === 'object' && 'content' in dataObj) {
+            const content = dataObj.content;
+            // 只要 content 字段存在就发送（即使是空字符串也可以）
+            if (typeof content === 'string') {
+              onChunk(content);
+              continue;
+            }
           }
           
-          // 过滤掉建议和其他非内容消息
-          if (dataObj.type === 'follow_up' || dataObj.msg_type === 'follow_up') {
-            continue;
-          }
-          
-          // 必须有有效的 content 字符串
-          const content = dataObj.content;
-          if (typeof content !== 'string' || !content.trim()) {
-            continue;
-          }
-          
-          // 有效内容，输出
-          onChunk(content);
+          // 如果没有 content 字段，跳过
+          continue;
         } catch (e) {
-          // 任何 JSON 解析失败都跳过
+          // JSON 解析失败，跳过这一行
+          continue;
         }
       }
     }
