@@ -103,6 +103,15 @@ class LLMAgent:
                     "role": msg["role"],
                     "type": "question" if msg["role"] == "user" else "answer"
                 })
+        
+        # 添加当前问题作为最后一条消息
+        body["additional_messages"].append({
+            "content": request.prompt,
+            "content_type": "text",
+            "role": "user",
+            "type": "question"
+        })
+        
         print("Request Body:", json.dumps(body, ensure_ascii=False, indent=2))
         try:
             # 发起流式请求
@@ -114,18 +123,31 @@ class LLMAgent:
             ) as response:
                 async for chunk in response.aiter_text():
                     if chunk:
-                        yield f"data: {chunk}\n\n"
+                        # Coze API 的响应已经是 SSE 格式，直接转发
+                        yield chunk
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            # 异常时，按 SSE 格式返回错误信息
+            yield f"data: {json.dumps({'error': str(e), 'msg_type': 'error'})}\n\n"
         finally:
+            # 确保发送完成标记
             yield "data: [DONE]\n\n"
     
     def load_context(self, user_id: str) -> List[Dict[str, Any]]:
-        """加载用户对话历史"""
+        """加载用户对话历史（带去重）"""
         # 使用数据库加载对话历史
         history = db_manager.get_conversation_history(user_id)
-        # 转换为旧格式以保持兼容性
-        return [{"role": item["role"], "content": item["content"]} for item in history]
+        
+        # 转换为旧格式并去重（保留第一次出现）
+        seen = set()
+        result = []
+        for item in history:
+            # 创建唯一标识：role + content 的组合
+            key = (item["role"], item["content"])
+            if key not in seen:
+                seen.add(key)
+                result.append({"role": item["role"], "content": item["content"]})
+        
+        return result
     
     def save_context(self, user_id: str, context: List[Dict[str, Any]]) -> None:
         """保存用户对话历史"""

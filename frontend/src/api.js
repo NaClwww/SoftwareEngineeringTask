@@ -62,7 +62,6 @@ export async function streamLLM({ prompt, token, onChunk, onDone, onError }) {
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
-      let currentEvent = '';
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed.startsWith('data:')) continue;
@@ -71,36 +70,35 @@ export async function streamLLM({ prompt, token, onChunk, onDone, onError }) {
         if (!payload) continue;
         if (payload === '[DONE]') continue;
 
-        // 记录当前 event，后续只处理 conversation.message.delta 的数据行
+        // 跳过所有 event: 开头的行
         if (payload.startsWith('event:')) {
-          currentEvent = payload.slice('event:'.length).trim();
-          continue;
-        }
-
-        if (currentEvent && currentEvent !== 'conversation.message.delta') {
           continue;
         }
 
         try {
-          const start = payload.indexOf('{');
-          const end = payload.lastIndexOf('}');
-          if (start !== -1 && end !== -1 && end > start) {
-            const obj = JSON.parse(payload.slice(start, end + 1));
-            const parts = [];
-            if (obj.content) parts.push(obj.content);
-            if (obj.data && obj.data.content) parts.push(obj.data.content);
-            if (obj.data && Array.isArray(obj.data.contents)) {
-              for (const c of obj.data.contents) {
-                if (c && typeof c.content === 'string') parts.push(c.content);
-              }
-            }
-            if (parts.length === 0) parts.push(payload);
-            for (const p of parts) onChunk(p);
-          } else {
-            onChunk(payload);
+          // 严格解析 JSON，必须是有效的 JSON
+          const dataObj = JSON.parse(payload);
+          
+          // 必须是对象且有 content 字段
+          if (!dataObj || typeof dataObj !== 'object') {
+            continue;
           }
+          
+          // 过滤掉建议和其他非内容消息
+          if (dataObj.type === 'follow_up' || dataObj.msg_type === 'follow_up') {
+            continue;
+          }
+          
+          // 必须有有效的 content 字符串
+          const content = dataObj.content;
+          if (typeof content !== 'string' || !content.trim()) {
+            continue;
+          }
+          
+          // 有效内容，输出
+          onChunk(content);
         } catch (e) {
-          onChunk(payload);
+          // 任何 JSON 解析失败都跳过
         }
       }
     }

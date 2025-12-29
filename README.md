@@ -80,3 +80,5 @@ curl -X POST "http://localhost:8000/stream-coze" \
   },
   "bot_id": "your_bot_id"
 }'
+
+

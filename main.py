@@ -10,6 +10,7 @@ from agent import LLMAgent, QueryRequest, QueryResponse
 from user import user_manager, get_current_user_from_token
 from database import db_manager
 import os
+from difflib import SequenceMatcher
 
 # 加载环境变量
 if os.path.exists(".env"):
@@ -41,6 +42,41 @@ llm_agent = LLMAgent()
 
 # 全局锁，确保流式请求串行执行，避免并发交叉
 stream_lock = asyncio.Lock()
+
+def is_duplicate_content(content: str, sent_contents: set, min_length: int = 20, similarity_threshold: float = 0.85) -> bool:
+    """
+    检查内容是否重复。
+    只对足够长的内容启用相似度匹配，短内容使用精确匹配。
+    
+    Args:
+        content: 当前内容
+        sent_contents: 已发送内容的集合
+        min_length: 启用相似度检测的最小内容长度，默认20个字符
+        similarity_threshold: 相似度阈值（0-1），默认0.85表示85%相似就认为是重复
+    
+    Returns:
+        True 如果是重复，False 如果是新内容
+    """
+    if not content.strip():
+        return True
+    
+    # 对于很短的内容，使用精确匹配
+    if len(content) < min_length:
+        return content in sent_contents
+    
+    # 对于较长的内容，使用相似度匹配
+    for sent in sent_contents:
+        # 只有当两个内容都足够长时，才进行相似度计算
+        if len(sent) >= min_length:
+            similarity = SequenceMatcher(None, content, sent).ratio()
+            if similarity >= similarity_threshold:
+                return True
+        else:
+            # 如果已发送内容较短，使用精确匹配
+            if content == sent:
+                return True
+    
+    return False
 
 # 用户注册和登录的数据模型
 class UserCreate(BaseModel):
@@ -153,10 +189,10 @@ async def get_health_data(credentials: HTTPAuthorizationCredentials = Depends(se
     """获取用户的健康数据"""
     try:
         # 验证JWT令牌并获取用户信息
-            user = get_current_user_from_token(credentials.credentials)
-            if not user:
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的认证令牌")
-        
+        user = get_current_user_from_token(credentials.credentials)
+        if not user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="无效的认证令牌")
+    
         user_id = user.get("user_id")
         if not user_id:
             return {"error": "无法从令牌中获取用户ID"}
@@ -255,7 +291,8 @@ async def stream_llm(request: QueryRequest, credentials: HTTPAuthorizationCreden
         return {"error": "无法从令牌中获取用户ID"}
     
     # 保存用户的问题到对话历史
-    llm_agent.save_context(user_id, [{"role": "user", "content": request.prompt}])
+    db_manager.create_user(user_id)
+    db_manager.save_conversation_turn(user_id, "user", request.prompt)
     
     # 创建新的请求对象，使用从JWT获取的user_id
     updated_request = QueryRequest(
@@ -271,40 +308,111 @@ async def stream_llm(request: QueryRequest, credentials: HTTPAuthorizationCreden
     async def save_response_and_stream():
         async with stream_lock:  # 串行化流式处理，避免并发导致顺序错乱
             full_response = ""
+            last_event_type = None  # 记录最后看到的事件类型
+            sent_contents = set()  # 全局去重：记录所有已发送的内容
+            
             async for chunk in llm_agent.stream_custom_llm(updated_request):
-                # chunk 可能包含多行 SSE，例如：
-                # data: event:conversation.message.delta
-                # data:{...}
-                for line in chunk.splitlines():
+                # chunk 是来自 Coze API 的原始 SSE 响应，可能包含多行
+                
+                lines = chunk.splitlines()
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
                     if not line.startswith("data:"):
+                        i += 1
                         continue
-                    # 兼容 "data: " 和 "data:{" 两种格式
-                    payload = line[len("data:"):].lstrip()
-
-                    # 跳过事件标记行或结束标记
-                    if payload.startswith("event:") or payload.startswith("[DONE]"):
+                    
+                    payload = line[len("data:"):].strip()
+                    
+                    # 跳过空行和完成标记
+                    if not payload or payload == "[DONE]":
+                        i += 1
                         continue
-
+                    
+                    # ===== 处理事件行 =====
+                    if payload.startswith("event:"):
+                        # 检查是否是 conversation.message.completed 事件
+                        if "conversation.message.completed" in payload:
+                            # 跳过这个事件行和下一个 data 行（一对）
+                            i += 1  # 跳过事件行
+                            # 找到并跳过下一个 data 行
+                            while i < len(lines) and not lines[i].startswith("data:"):
+                                i += 1
+                            if i < len(lines):
+                                i += 1  # 跳过那个 data 行
+                            continue
+                        else:
+                            # 其他事件，跳过
+                            i += 1
+                            continue
+                    
+                    # 处理 data: 行
                     try:
-                        # 截取花括号内容，尽量解析 JSON
-                        start, end = payload.find("{"), payload.rfind("}")
-                        if start != -1 and end != -1 and end > start:
-                            payload = payload[start:end+1]
+                        # 尝试解析为 JSON
                         data_obj = json.loads(payload)
-                        content = data_obj.get("content", "")
+                        
+                        # 必须是字典
+                        if not isinstance(data_obj, dict):
+                            i += 1
+                            continue
+                        
+                        # ===== 黑名单过滤 =====
+                        
+                        # 1. 检查 msg_type（最重要的过滤点）
+                        msg_type = data_obj.get("msg_type", "")
+                        if msg_type in ("generate_answer_finish", "end_turn", "conversation.message.completed", 
+                                       "tool_call", "function_call", "thinking", "reasoning"):
+                            i += 1
+                            continue
+                        
+                        # 2. 如果有 data 字段且包含 finish_reason，这是完成标记，跳过
+                        if data_obj.get("data") and "finish_reason" in str(data_obj.get("data", "")):
+                            i += 1
+                            continue
+                        
+                        # 3. 检查 type 字段（follow_up 是建议，要跳过）
+                        item_type = data_obj.get("type", "")
+                        if item_type in ("follow_up", "tool_call", "function_call"):
+                            i += 1
+                            continue
+                        
+                        # 4. 检查危险字段
+                        if data_obj.get("tool_calls") or data_obj.get("name") or data_obj.get("from_module"):
+                            i += 1
+                            continue
+                        
+                        # ===== 提取并验证内容 =====
+                        
+                        content = data_obj.get("content")
+                        if not isinstance(content, str) or not content.strip():
+                            i += 1
+                            continue
+                        
+                        # ===== 全局去重（使用相似度检测） =====
+                        
+                        # 只对足够长的内容启用相似度去重，短内容使用精确匹配
+                        # 最小长度设为10个字符，相似度阈值设为0.85
+                        if is_duplicate_content(content, sent_contents, min_length=10, similarity_threshold=0.85):
+                            i += 1
+                            continue
+                        
+                        # 记录已发送的内容并转发
+                        sent_contents.add(content)
                         full_response += content
-                    except json.JSONDecodeError:
-                        # 兜底：若是纯文本且不是事件/标记，则累积
-                        if not payload.startswith("event:") and not payload.startswith("{"):
-                            full_response += payload
-                    except Exception:
+                        yield f"data: {json.dumps({'content': content})}\n\n"
+                    
+                    except (json.JSONDecodeError, ValueError):
+                        # 非 JSON 数据，完全跳过
                         pass
-
-                yield chunk
+                    
+                    i += 1
+            
             # 保存完整的响应到对话历史
-            print(f"assistant响应: {full_response}")
             if full_response:
-                llm_agent.save_context(user_id, [{"role": "assistant", "content": full_response}])
+                db_manager.save_conversation_turn(user_id, "assistant", full_response)
+            
+            # 发送完成标记
+            yield "data: [DONE]\n\n"
     
     return StreamingResponse(
         save_response_and_stream(),
