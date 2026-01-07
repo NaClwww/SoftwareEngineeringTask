@@ -29,7 +29,7 @@ DEFAULT_BOT_ID=your_default_bot_id_here
 ## 启动服务
 
 ```bash
-uvicorn main:app --reload
+uv run main.py
 ```
 
 或者直接运行：

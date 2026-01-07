@@ -28,7 +28,7 @@ function AppShell() {
             <header className="card header">
                 <div>
                     <h1>PJGQ Health Agent</h1>
-                    <p className="sub">登录后可聊天与编辑健康数据</p>
+                    {/* <p className="sub">登录后可聊天与编辑健康数据</p> */}
                 </div>
                 <nav className="nav">
                     <Link to="/chat">对话</Link>

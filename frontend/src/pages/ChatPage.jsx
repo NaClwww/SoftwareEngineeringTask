@@ -1,5 +1,9 @@
 import { useState } from 'react';
 import { streamLLM } from '../api.js';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 export default function ChatPage({ token }) {
     const [prompt, setPrompt] = useState('');
@@ -45,7 +49,32 @@ export default function ChatPage({ token }) {
                     {messages.map((m, idx) => (
                         <div key={idx} className={`bubble ${m.role}`}>
                             <span className="role">{m.role === 'user' ? '我' : '助手'}</span>
-                            <div className="text">{m.text || (streaming && m.role === 'assistant' ? '生成中...' : '')}</div>
+                            <div className="text">
+                                <ReactMarkdown
+                                    remarkPlugins={[remarkGfm]}
+                                    components={{
+                                        code({ node, inline, className, children, ...props }) {
+                                            const match = /language-(\w+)/.exec(className || '');
+                                            return !inline && match ? (
+                                                <SyntaxHighlighter
+                                                    style={oneLight}
+                                                    language={match[1]}
+                                                    PreTag="div"
+                                                    {...props}
+                                                >
+                                                    {String(children).replace(/\n$/, '')}
+                                                </SyntaxHighlighter>
+                                            ) : (
+                                                <code className={className} {...props}>
+                                                    {children}
+                                                </code>
+                                            );
+                                        },
+                                    }}
+                                >
+                                    {m.text || (streaming && m.role === 'assistant' ? '生成中...' : '')}
+                                </ReactMarkdown>
+                            </div>
                         </div>
                     ))}
                 </div>

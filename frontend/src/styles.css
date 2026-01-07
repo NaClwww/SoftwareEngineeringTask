@@ -159,6 +159,8 @@ h2 {
     flex: 1;
     overflow: hidden;
     padding: 20px 32px;
+    /* 限制子元素增长，允许内部滚动 */
+    min-height: 0;
 }
 
 
@@ -362,6 +364,8 @@ button.ghost:hover:not(:disabled) {
     padding: 16px;
     display: flex;
     flex-direction: column;
+    /* 保证不会撑开页面：限制高度为视口减去顶部/输入区预留高度 */
+    max-height: calc(50vh);
 }
 
 .bubble {
